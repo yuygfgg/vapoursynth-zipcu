@@ -59,6 +59,7 @@ const ModKey = struct {
     h: i32,
     stride: i32,
     sigma: [3]f32,
+    tau_match: f32,
     block_step: i32,
     bm_range: i32,
     ps_num: i32,
@@ -797,6 +798,7 @@ fn initCuda(d: *Data, device_id: i32, num_streams: usize, acc_short: *?AccShort)
             \\#define SIGMA_Y {x}f
             \\#define SIGMA_U {x}f
             \\#define SIGMA_V {x}f
+            \\#define TAU_MATCH {x}f
             \\#define BLOCK_STEP {d}
             \\#define BM_RANGE {d}
             \\#define RADIUS {d}
@@ -813,13 +815,13 @@ fn initCuda(d: *Data, device_id: i32, num_streams: usize, acc_short: *?AccShort)
             \\#define TRANSFORM_1D {s}
             \\
         , .{
-            e.key.w,                  e.key.h,               e.key.stride,
-            e.key.sigma[0],           e.key.sigma[1],        e.key.sigma[2],
-            e.key.block_step,         e.key.bm_range,        d.radius,
-            e.key.ps_num,             e.key.ps_range,        @intFromBool(d.radius > 0),
-            @intFromBool(d.chroma),   @intFromBool(d.final), extractor,
-            d.warps,                  e.key.proc_mask,
-            @tagName(e.key.bm_error), @tagName(e.key.t2d),   @tagName(e.key.t1d),
+            e.key.w,                    e.key.h,                e.key.stride,
+            e.key.sigma[0],             e.key.sigma[1],         e.key.sigma[2],
+            e.key.tau_match,            e.key.block_step,       e.key.bm_range,
+            d.radius,                   e.key.ps_num,           e.key.ps_range,
+            @intFromBool(d.radius > 0), @intFromBool(d.chroma), @intFromBool(d.final),
+            extractor,                  d.warps,                e.key.proc_mask,
+            @tagName(e.key.bm_error),   @tagName(e.key.t2d),    @tagName(e.key.t1d),
         }) catch return error.OutOfMemory;
         defer allocator.free(defines);
 
@@ -1016,6 +1018,13 @@ fn createInner(
     }
     for (0..3) |i| d.process[i] = !(sigma[i] < FLT_EPSILON);
 
+    // Reference BM3D exposes this as thMSE (8-bit squared-error scale).
+    // Convert it to the normalized 8x8 SSD used by the CUDA matcher.
+    const tau_input = map_in.getValue(f32, "tau_match") orelse
+        (if (d.final) 200.0 + sigma[0] * 10.0 else 400.0 + sigma[0] * 80.0);
+    if (!(tau_input >= 0.0)) return map_out.setError("BM3D: \"tau_match\" must be non-negative.");
+    const tau_match = tau_input * (64.0 / 65025.0);
+
     // Exact f32 of stepwise C++ product (comptime fold is 1 ULP off).
     const sigma_factor: f32 = if (d.final)
         @bitCast(@as(u32, 0x3e40c0c1))
@@ -1110,6 +1119,7 @@ fn createInner(
                 .h = h,
                 .stride = stride,
                 .sigma = sigma,
+                .tau_match = tau_match,
                 .block_step = block_step[0],
                 .bm_range = bm_range[0],
                 .ps_num = ps_num[0],
@@ -1151,6 +1161,7 @@ fn createInner(
                     .h = h,
                     .stride = stride,
                     .sigma = .{ sigma[p], sigma[p], sigma[p] },
+                    .tau_match = tau_match,
                     .block_step = block_step[p],
                     .bm_range = bm_range[p],
                     .ps_num = ps_num[p],

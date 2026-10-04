@@ -3,6 +3,7 @@
 #define TEMPORAL_STRIDE (HEIGHT * STRIDE)
 #define TEMPORAL_WIDTH (2 * RADIUS + 1)
 #define MAX_TW 33
+#define BM3D_EPSILON 1.192092896e-7f
 
 struct AggSrc {
     const float *p[MAX_TW];
@@ -44,5 +45,5 @@ extern "C" __global__ __launch_bounds__(256) void vaggregate(
         sum_w += wdst[TEMPORAL_STRIDE + i];
     }
 
-    dst[plane * TEMPORAL_STRIDE + i] = __fdiv_rn(sum_v, sum_w);
+    dst[plane * TEMPORAL_STRIDE + i] = sum_w > BM3D_EPSILON ? __fdiv_rn(sum_v, sum_w) : 0.0f;
 }

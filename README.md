@@ -55,6 +55,7 @@ core.vszipcu.Bilateral(clip clip[,
 core.vszipcu.BM3Dv2(clip clip[,      # and BM3D, same signature
     clip    ref,                     # empirical Wiener (2nd pass); also drives block matching
     float[] sigma=3.0,               # per-plane; < FLT_EPSILON => plane not processed
+    float   tau_match,               # block-match MSE in 8-bit units; default follows sigma/profile
     int[]   block_step=8,            # per-plane, 1..8
     int[]   bm_range=9,              # per-plane, > 0
     int     radius=0,                # temporal radius; 0 = spatial only
