@@ -61,6 +61,7 @@ const ModKey = struct {
     sigma: [3]f32,
     tau_match: f32,
     block_step: i32,
+    group_size: i32,
     bm_range: i32,
     ps_num: i32,
     ps_range: i32,
@@ -384,7 +385,8 @@ fn process(d: *Data, s: *Stream, win: *const Window, dst: ZFrameW) CreateError!v
         const w: u32 = @intCast(e.key.w);
         const h: u32 = @intCast(e.key.h);
         const bs: u32 = @intCast(e.key.block_step);
-        const groups_x = ceilDiv(w, 4 * bs);
+        const groups_per_warp: u32 = if (e.key.group_size > 8) 2 else 4;
+        const groups_x = ceilDiv(w, groups_per_warp * bs);
         try s.stream.launch(d.fn_bm3d[e.mod_idx], .{
             .grid = .{ ceilDiv(groups_x, d.warps), ceilDiv(h, bs), 1 },
             .block = .{ 32 * d.warps, 1, 1 },
@@ -595,7 +597,8 @@ fn processFused(d: *Data, s: *Stream, fw: *const FusedWin, n: i32, dst: ZFrameW)
             const w: u32 = @intCast(e.key.w);
             const h: u32 = @intCast(e.key.h);
             const bs: u32 = @intCast(e.key.block_step);
-            const groups_x = ceilDiv(w, 4 * bs);
+            const groups_per_warp: u32 = if (e.key.group_size > 8) 2 else 4;
+            const groups_x = ceilDiv(w, groups_per_warp * bs);
             try s.stream.launch(d.fn_bm3d[e.mod_idx], .{
                 .grid = .{ ceilDiv(groups_x, d.warps), ceilDiv(h, bs), 1 },
                 .block = .{ 32 * d.warps, 1, 1 },
@@ -800,6 +803,7 @@ fn initCuda(d: *Data, device_id: i32, num_streams: usize, acc_short: *?AccShort)
             \\#define SIGMA_V {x}f
             \\#define TAU_MATCH {x}f
             \\#define BLOCK_STEP {d}
+            \\#define MAX_GROUP_SIZE {d}
             \\#define BM_RANGE {d}
             \\#define RADIUS {d}
             \\#define PS_NUM {d}
@@ -815,13 +819,14 @@ fn initCuda(d: *Data, device_id: i32, num_streams: usize, acc_short: *?AccShort)
             \\#define TRANSFORM_1D {s}
             \\
         , .{
-            e.key.w,                    e.key.h,                e.key.stride,
-            e.key.sigma[0],             e.key.sigma[1],         e.key.sigma[2],
-            e.key.tau_match,            e.key.block_step,       e.key.bm_range,
-            d.radius,                   e.key.ps_num,           e.key.ps_range,
-            @intFromBool(d.radius > 0), @intFromBool(d.chroma), @intFromBool(d.final),
-            extractor,                  d.warps,                e.key.proc_mask,
-            @tagName(e.key.bm_error),   @tagName(e.key.t2d),    @tagName(e.key.t1d),
+            e.key.w,               e.key.h,                    e.key.stride,
+            e.key.sigma[0],        e.key.sigma[1],             e.key.sigma[2],
+            e.key.tau_match,       e.key.block_step,           e.key.group_size,
+            e.key.bm_range,        d.radius,                   e.key.ps_num,
+            e.key.ps_range,        @intFromBool(d.radius > 0), @intFromBool(d.chroma),
+            @intFromBool(d.final), extractor,                  d.warps,
+            e.key.proc_mask,       @tagName(e.key.bm_error),   @tagName(e.key.t2d),
+            @tagName(e.key.t1d),
         }) catch return error.OutOfMemory;
         defer allocator.free(defines);
 
@@ -1040,9 +1045,13 @@ fn createInner(
     for (bm_range) |v| {
         if (v <= 0) return map_out.setError("BM3D: \"bm_range\" must be positive.");
     }
+    const group_size = perPlane(i32, map_in, "group_size", 16);
+    for (group_size) |v| {
+        if (v <= 0 or v > 16) return map_out.setError("BM3D: \"group_size\" must be in range [1, 16].");
+    }
     const ps_num = perPlane(i32, map_in, "ps_num", 2);
     for (ps_num) |v| {
-        if (v <= 0 or v > 8) return map_out.setError("BM3D: \"ps_num\" must be in range [1, 8].");
+        if (v <= 0 or v > 16) return map_out.setError("BM3D: \"ps_num\" must be in range [1, 16].");
     }
     const ps_range = perPlane(i32, map_in, "ps_range", 4);
     for (ps_range) |v| {
@@ -1079,6 +1088,13 @@ fn createInner(
         if (map_in.getData("transform_1d_s", idx)) |sv| {
             t1d[i] = Transform.parse(sv) orelse return map_out.setError("BM3D: invalid \"transform_1d_s\".");
         } else if (i > 0) t1d[i] = t1d[i - 1];
+    }
+    for (0..3) |i| {
+        if (t1d[i] != .dct and
+            (group_size[i] > 8 or (group_size[i] & (group_size[i] - 1)) != 0))
+        {
+            return map_out.setError("BM3D: non-DCT transform_1d_s requires group_size 1, 2, 4, or 8.");
+        }
     }
 
     const device_id = map_in.getValue(i32, "device_id") orelse 0;
@@ -1121,6 +1137,7 @@ fn createInner(
                 .sigma = sigma,
                 .tau_match = tau_match,
                 .block_step = block_step[0],
+                .group_size = group_size[0],
                 .bm_range = bm_range[0],
                 .ps_num = ps_num[0],
                 .ps_range = ps_range[0],
@@ -1163,6 +1180,7 @@ fn createInner(
                     .sigma = .{ sigma[p], sigma[p], sigma[p] },
                     .tau_match = tau_match,
                     .block_step = block_step[p],
+                    .group_size = group_size[p],
                     .bm_range = bm_range[p],
                     .ps_num = ps_num[p],
                     .ps_range = ps_range[p],

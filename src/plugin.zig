@@ -82,7 +82,7 @@ export fn VapourSynthPluginInit2(plugin: *vs.Plugin, vspapi: *const vs.PLUGINAPI
     );
     // fast_fused is BM3Dv2-only; standalone BM3D accepts and ignores it (composed path re-invokes BM3D with this map).
     const bm3d_sig = "clip:vnode;ref:vnode:opt;sigma:float[]:opt;tau_match:float:opt;block_step:int[]:opt;" ++
-        "bm_range:int[]:opt;radius:int:opt;ps_num:int[]:opt;ps_range:int[]:opt;" ++
+        "bm_range:int[]:opt;group_size:int[]:opt;radius:int:opt;ps_num:int[]:opt;ps_range:int[]:opt;" ++
         "chroma:int:opt;device_id:int:opt;num_streams:int:opt;" ++
         "extractor_exp:int:opt;bm_error_s:data[]:opt;transform_2d_s:data[]:opt;" ++
         "transform_1d_s:data[]:opt;zero_init:int:opt;fast_fused:int:opt;";

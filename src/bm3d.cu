@@ -9,16 +9,16 @@
 
 __device__ static const int smem_stride = 32 + 1;
 
-// BM3D uses a separable Kaiser window during aggregation. This beta=2 window
-// is normalized to the peak of the window, so it affects overlap weighting
-// without changing the DC level of a single estimate.
-__device__ static inline float kaiser8(int i) {
-    constexpr float w[8] = {
-        0.444985f, 0.691123f, 0.889450f, 1.0f,
-        1.0f, 0.889450f, 0.691123f, 0.444985f,
-    };
-    return w[i];
-}
+// An eight-lane group is enough for the original limit. A larger limit uses
+// two copies of the eight spatial lanes: the first half does the transforms
+// and aggregation, while the second half provides extra candidate ranks.
+#if MAX_GROUP_SIZE > 8
+#define GROUP_WIDTH 16
+#define GROUPS_PER_WARP 2
+#else
+#define GROUP_WIDTH 8
+#define GROUPS_PER_WARP 4
+#endif
 
 template <auto transform_impl, int stride = 256, int howmany = 8, int howmany_stride = 32>
 __device__ static inline void transform_pack8_interleave4(float *__restrict__ data, float *__restrict__ buffer) {
@@ -133,6 +133,43 @@ __device__ static inline void dct(float v[8]) {
     }
 }
 
+#if MAX_GROUP_SIZE > 8
+__device__ __constant__ static const float dct16_coeffs[16][16] = {
+    {1.41421356f, 1.41421356f, 1.41421356f, 1.41421356f, 1.41421356f, 1.41421356f, 1.41421356f, 1.41421356f,
+     1.41421356f, 1.41421356f, 1.41421356f, 1.41421356f, 1.41421356f, 1.41421356f, 1.41421356f, 1.41421356f},
+    {1.99036945f, 1.91388067f, 1.76384253f, 1.54602091f, 1.26878657f, 0.942793474f, 0.580569355f, 0.196034281f,
+     -0.196034281f, -0.580569355f, -0.942793474f, -1.26878657f, -1.54602091f, -1.76384253f, -1.91388067f, -1.99036945f},
+    {1.96157056f, 1.66293922f, 1.11114047f, 0.390180644f, -0.390180644f, -1.11114047f, -1.66293922f, -1.96157056f,
+     -1.96157056f, -1.66293922f, -1.11114047f, -0.390180644f, 0.390180644f, 1.11114047f, 1.66293922f, 1.96157056f},
+    {1.91388067f, 1.26878657f, 0.196034281f, -0.942793474f, -1.76384253f, -1.99036945f, -1.54602091f, -0.580569355f,
+     0.580569355f, 1.54602091f, 1.99036945f, 1.76384253f, 0.942793474f, -0.196034281f, -1.26878657f, -1.91388067f},
+    {1.84775907f, 0.765366865f, -0.765366865f, -1.84775907f, -1.84775907f, -0.765366865f, 0.765366865f, 1.84775907f,
+     1.84775907f, 0.765366865f, -0.765366865f, -1.84775907f, -1.84775907f, -0.765366865f, 0.765366865f, 1.84775907f},
+    {1.76384253f, 0.196034281f, -1.54602091f, -1.91388067f, -0.580569355f, 1.26878657f, 1.99036945f, 0.942793474f,
+     -0.942793474f, -1.99036945f, -1.26878657f, 0.580569355f, 1.91388067f, 1.54602091f, -0.196034281f, -1.76384253f},
+    {1.66293922f, -0.390180644f, -1.96157056f, -1.11114047f, 1.11114047f, 1.96157056f, 0.390180644f, -1.66293922f,
+     -1.66293922f, 0.390180644f, 1.96157056f, 1.11114047f, -1.11114047f, -1.96157056f, -0.390180644f, 1.66293922f},
+    {1.54602091f, -0.942793474f, -1.91388067f, 0.196034281f, 1.99036945f, 0.580569355f, -1.76384253f, -1.26878657f,
+     1.26878657f, 1.76384253f, -0.580569355f, -1.99036945f, -0.196034281f, 1.91388067f, 0.942793474f, -1.54602091f},
+    {1.41421356f, -1.41421356f, -1.41421356f, 1.41421356f, 1.41421356f, -1.41421356f, -1.41421356f, 1.41421356f,
+     1.41421356f, -1.41421356f, -1.41421356f, 1.41421356f, 1.41421356f, -1.41421356f, -1.41421356f, 1.41421356f},
+    {1.26878657f, -1.76384253f, -0.580569355f, 1.99036945f, -0.196034281f, -1.91388067f, 0.942793474f, 1.54602091f,
+     -1.54602091f, -0.942793474f, 1.91388067f, 0.196034281f, -1.99036945f, 0.580569355f, 1.76384253f, -1.26878657f},
+    {1.11114047f, -1.96157056f, 0.390180644f, 1.66293922f, -1.66293922f, -0.390180644f, 1.96157056f, -1.11114047f,
+     -1.11114047f, 1.96157056f, -0.390180644f, -1.66293922f, 1.66293922f, 0.390180644f, -1.96157056f, 1.11114047f},
+    {0.942793474f, -1.99036945f, 1.26878657f, 0.580569355f, -1.91388067f, 1.54602091f, 0.196034281f, -1.76384253f,
+     1.76384253f, -0.196034281f, -1.54602091f, 1.91388067f, -0.580569355f, -1.26878657f, 1.99036945f, -0.942793474f},
+    {0.765366865f, -1.84775907f, 1.84775907f, -0.765366865f, -0.765366865f, 1.84775907f, -1.84775907f, 0.765366865f,
+     0.765366865f, -1.84775907f, 1.84775907f, -0.765366865f, -0.765366865f, 1.84775907f, -1.84775907f, 0.765366865f},
+    {0.580569355f, -1.54602091f, 1.99036945f, -1.76384253f, 0.942793474f, 0.196034281f, -1.26878657f, 1.91388067f,
+     -1.91388067f, 1.26878657f, -0.196034281f, -0.942793474f, 1.76384253f, -1.99036945f, 1.54602091f, -0.580569355f},
+    {0.390180644f, -1.11114047f, 1.66293922f, -1.96157056f, 1.96157056f, -1.66293922f, 1.11114047f, -0.390180644f,
+     -0.390180644f, 1.11114047f, -1.66293922f, 1.96157056f, -1.96157056f, 1.66293922f, -1.11114047f, 0.390180644f},
+    {0.196034281f, -0.580569355f, 0.942793474f, -1.26878657f, 1.54602091f, -1.76384253f, 1.91388067f, -1.99036945f,
+     1.99036945f, -1.91388067f, 1.76384253f, -1.54602091f, 1.26878657f, -0.942793474f, 0.580569355f, -0.196034281f},
+};
+#endif
+
 template <bool forward>
 __device__ static inline void haar(float v[8]) {
     if constexpr (forward) {
@@ -163,29 +200,23 @@ __device__ static inline void haar(float v[8]) {
         v[6] = scale * KP2_000000000 * T6;
         v[7] = scale * KP2_000000000 * T8;
     } else {
-        float KP1_414213562{+1.414213562373095048801688724209698078569671875};
-        float KP2_000000000{+2.000000000000000000000000000000000000000000000};
+        // The inverse is the transpose of the scaled forward matrix.  Keep
+        // all input coefficients live until every output has been formed.
+        constexpr float s = 1.414213562373095048801688724209698078569671875f;
+        const float c0 = v[0], c1 = v[1], c2 = v[2], c3 = v[3];
+        const float c4 = v[4], c5 = v[5], c6 = v[6], c7 = v[7];
+        const float dc_plus = s * (c0 + c1);
+        const float dc_minus = s * (c0 - c1);
+        const float two_s = 2.0f * s;
 
-        auto T1 = v[0] + v[1];
-        auto T2 = v[0] - v[1];
-        auto T3 = KP1_414213562 * v[2] + KP2_000000000 * v[4];
-        auto T4 = KP1_414213562 * v[2] - KP2_000000000 * v[4];
-        auto T5 = -KP1_414213562 * v[2] + KP2_000000000 * v[4];
-        auto T6 = -KP1_414213562 * v[2] - KP2_000000000 * v[4];
-        auto T7 = KP1_414213562 * v[2] + KP2_000000000 * v[4];
-        auto T8 = KP1_414213562 * v[2] - KP2_000000000 * v[4];
-        auto T9 = -KP1_414213562 * v[2] + KP2_000000000 * v[4];
-        auto T10 = -KP1_414213562 * v[2] - KP2_000000000 * v[4];
-
-        auto scale = KP1_414213562;
-        v[0] = scale * (T1 + T3);
-        v[1] = scale * (T1 + T4);
-        v[2] = scale * (T1 + T5);
-        v[3] = scale * (T1 + T6);
-        v[4] = scale * (T2 + T7);
-        v[5] = scale * (T2 + T8);
-        v[6] = scale * (T2 + T9);
-        v[7] = scale * (T2 + T10);
+        v[0] = dc_plus + 2.0f * c2 + two_s * c4;
+        v[1] = dc_plus + 2.0f * c2 - two_s * c4;
+        v[2] = dc_plus - 2.0f * c2 + two_s * c5;
+        v[3] = dc_plus - 2.0f * c2 - two_s * c5;
+        v[4] = dc_minus + 2.0f * c3 + two_s * c6;
+        v[5] = dc_minus + 2.0f * c3 - two_s * c6;
+        v[6] = dc_minus - 2.0f * c3 + two_s * c7;
+        v[7] = dc_minus - 2.0f * c3 - two_s * c7;
     }
 }
 
@@ -291,7 +322,7 @@ __device__ static inline void bior1_5(float v[8]) {
 }
 
 template <bool forward>
-__device__ static inline void dct_n(float v[8], int n) {
+__device__ static inline void dct_n(float v[GROUP_WIDTH], int n) {
     if (n == 8) {
         dct<forward>(v);
         return;
@@ -300,25 +331,44 @@ __device__ static inline void dct_n(float v[8], int n) {
         v[0] *= 1.4142135623730950488f;
         return;
     }
-    float out[8]{};
+#if MAX_GROUP_SIZE > 8
+    if (n == 16) {
+        float out[GROUP_WIDTH]{};
+        if constexpr (forward) {
+            for (int k = 0; k < 16; ++k)
+#pragma unroll
+                for (int j = 0; j < 16; ++j) out[k] += dct16_coeffs[k][j] * v[j];
+        } else {
+            for (int j = 0; j < 16; ++j)
+#pragma unroll
+                for (int k = 0; k < 16; ++k) out[j] += dct16_coeffs[k][j] * v[k];
+        }
+        for (int i = 0; i < GROUP_WIDTH; ++i) v[i] = out[i];
+        return;
+    }
+#endif
+    float out[GROUP_WIDTH]{};
     constexpr float pi = 3.14159265358979323846f;
+    constexpr float sqrt2 = 1.4142135623730950488f;
     if constexpr (forward) {
         for (int k = 0; k < n; ++k) {
             for (int j = 0; j < n; ++j)
                 out[k] += 2.0f * v[j] * cosf(pi * (j + 0.5f) * k / n);
+            if (k == 0) out[k] *= 0.7071067811865475244f;
         }
     } else {
+        const float dc = v[0] * sqrt2;
         for (int j = 0; j < n; ++j) {
-            out[j] = v[0];
+            out[j] = dc;
             for (int k = 1; k < n; ++k)
                 out[j] += 2.0f * v[k] * cosf(pi * (j + 0.5f) * k / n);
         }
     }
-    for (int i = 0; i < 8; ++i) v[i] = i < n ? out[i] : 0.0f;
+    for (int i = 0; i < GROUP_WIDTH; ++i) v[i] = i < n ? out[i] : 0.0f;
 }
 
 template <bool forward>
-__device__ static inline void wht_n(float v[8], int n) {
+__device__ static inline void wht_n(float v[GROUP_WIDTH], int n) {
     if (n == 8) {
         wht<forward>(v);
         return;
@@ -327,7 +377,7 @@ __device__ static inline void wht_n(float v[8], int n) {
         v[0] *= 1.4142135623730950488f;
         return;
     }
-    float out[8]{};
+    float out[GROUP_WIDTH]{};
     for (int k = 0; k < n; ++k) {
         for (int j = 0; j < n; ++j) {
             const int bits = k & j;
@@ -337,13 +387,37 @@ __device__ static inline void wht_n(float v[8], int n) {
         }
         out[k] *= 1.4142135623730950488f;
     }
-    for (int i = 0; i < 8; ++i) v[i] = i < n ? out[i] : 0.0f;
+    for (int i = 0; i < GROUP_WIDTH; ++i) v[i] = i < n ? out[i] : 0.0f;
 }
 
 template <bool forward>
-__device__ static inline void haar_n(float v[8], int n) {
+__device__ static inline void haar_n(float v[GROUP_WIDTH], int n) {
     if (n == 8) {
         haar<forward>(v);
+        return;
+    }
+    if constexpr (!forward) {
+        float out[GROUP_WIDTH]{};
+#pragma unroll
+        for (int j = 0; j < n; ++j) {
+#pragma unroll
+            for (int k = 0; k < n; ++k) {
+                float basis;
+                if (k == 0) {
+                    basis = 1.4142135623730950488f;
+                } else {
+                    const int level = 31 - __clz(static_cast<unsigned>(k));
+                    const int span = n >> level;
+                    const int block = k - (1 << level);
+                    const int begin = block * span;
+                    basis = (j >= begin && j < begin + span) ?
+                        ((j - begin) < (span >> 1) ? 1.0f : -1.0f) * sqrtf(2.0f * n / span) : 0.0f;
+                }
+                out[j] += basis * v[k];
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < GROUP_WIDTH; ++i) v[i] = i < n ? out[i] : 0.0f;
         return;
     }
     if (n == 1) {
@@ -369,11 +443,11 @@ __device__ static inline void haar_n(float v[8], int n) {
         v[2] = s * (a - b) + 2.0f * d;
         v[3] = s * (a - b) - 2.0f * d;
     }
-    for (int i = 4; i < 8; ++i) v[i] = 0.0f;
+    for (int i = 4; i < GROUP_WIDTH; ++i) v[i] = 0.0f;
 }
 
 template <bool forward>
-__device__ static inline void bior1_5_n(float v[8], int n) {
+__device__ static inline void bior1_5_n(float v[GROUP_WIDTH], int n) {
     if (n == 8) bior1_5<forward>(v);
     else haar_n<forward>(v, n);
 }
@@ -386,12 +460,12 @@ template <bool forward>
 __device__ static inline void transform_group(float *data, int group_size) {
 #pragma unroll
     for (int iter = 0; iter < 8; ++iter, ++data) {
-        float v[8];
+        float v[GROUP_WIDTH]{};
 #pragma unroll
-        for (int i = 0; i < 8; ++i) v[i] = data[i * 8];
+        for (int i = 0; i < MAX_GROUP_SIZE; ++i) v[i] = data[i * 8];
         BM3D_GROUP_TRANSFORM(TRANSFORM_1D, forward, v, group_size);
 #pragma unroll
-        for (int i = 0; i < 8; ++i) data[i * 8] = v[i];
+        for (int i = 0; i < MAX_GROUP_SIZE; ++i) data[i * 8] = v[i];
     }
 }
 
@@ -506,20 +580,21 @@ __device__ static inline float ssd_norm(const float center[__restrict__ 8], cons
 }
 
 template <int stride = 256, int howmany = 8, int howmany_stride = 32>
-__device__ static inline void transpose_pack8_interleave4(float *__restrict__ data, float *__restrict__ buffer) {
+__device__ static inline void transpose_pack8_interleave4(
+    float *__restrict__ data, float *__restrict__ buffer, unsigned int mask) {
     int lane_id;
     asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
 
 #pragma unroll
     for (int iter = 0; iter < howmany; ++iter, data += howmany_stride) {
-        __syncwarp();
+        __syncwarp(mask);
 
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             buffer[i * smem_stride + lane_id] = data[i * stride];
         }
 
-        __syncwarp();
+        __syncwarp(mask);
 
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
@@ -531,9 +606,6 @@ __device__ static inline void transpose_pack8_interleave4(float *__restrict__ da
 // Arch-gated k reduction (sm_75/86 vs sequential): hard-thr vs Wiener shapes differ.
 template <int stride = 32>
 __device__ static inline float hard_thresholding(float *data, float sigma, int group_size, unsigned int mask) {
-    int lane_id;
-    asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
-
 #if __CUDA_ARCH__ == 750 || __CUDA_ARCH__ == 860
     float ks[4]{};
 #else
@@ -541,21 +613,16 @@ __device__ static inline float hard_thresholding(float *data, float sigma, int g
 #endif
 
 #pragma unroll
-    for (int i = 0; i < 64; ++i) {
+    for (int i = 0; i < MAX_GROUP_SIZE * 8; ++i) {
         auto val = data[i * stride];
 
-        // sigma is calibrated for the original 8-block group. The third
-        // dimension has noise gain sqrt(group_size / 8) after normalization.
-        const int x = lane_id & 7;
-        const int y = i & 7;
+        // The 8-point spatial transforms are normalized. After normalizing
+        // short group transforms as well, only the group dimension changes
+        // the coefficient noise gain: sqrt(group_size / 8).
         const int z = i >> 3;
-        const int zero_axes = (x == 0) + (y == 0) + (z == 0);
-        const float zero_scale = zero_axes == 3 ? 2.8284271247461901f :
-            (zero_axes == 2 ? 2.0f :
-             (zero_axes == 1 ? 1.4142135623730951f : 1.0f));
-        const float thr = sigma * sqrtf(group_size * (1.0f / 8.0f)) * zero_scale;
+        const float thr = sigma * sqrtf(group_size * (1.0f / 8.0f));
 
-        float flag = ((lane_id & 7) < group_size) && fabsf(val) >= thr;
+        float flag = (z < group_size) && fabsf(val) >= thr;
 
 #if __CUDA_ARCH__ == 750 || __CUDA_ARCH__ == 860
         ks[i % 4] += flag;
@@ -580,8 +647,8 @@ __device__ static inline float collaborative_hard(float *__restrict__ denoising_
 
 #pragma unroll
     for (int ndim = 0; ndim < 2; ++ndim) {
-        transform_pack8_interleave4<TRANSFORM_2D<true>, stride1, 8, stride2>(denoising_patch, buffer);
-        transpose_pack8_interleave4<stride1, 8, stride2>(denoising_patch, buffer);
+        transform_pack8_interleave4<TRANSFORM_2D<true>, stride1, MAX_GROUP_SIZE, stride2>(denoising_patch, buffer);
+        transpose_pack8_interleave4<stride1, MAX_GROUP_SIZE, stride2>(denoising_patch, buffer, mask);
     }
     transform_group<true>(denoising_patch, group_size);
 
@@ -589,8 +656,8 @@ __device__ static inline float collaborative_hard(float *__restrict__ denoising_
 
 #pragma unroll
     for (int ndim = 0; ndim < 2; ++ndim) {
-        transform_pack8_interleave4<TRANSFORM_2D<false>, stride1, 8, stride2>(denoising_patch, buffer);
-        transpose_pack8_interleave4<stride1, 8, stride2>(denoising_patch, buffer);
+        transform_pack8_interleave4<TRANSFORM_2D<false>, stride1, MAX_GROUP_SIZE, stride2>(denoising_patch, buffer);
+        transpose_pack8_interleave4<stride1, MAX_GROUP_SIZE, stride2>(denoising_patch, buffer, mask);
     }
     transform_group<false>(denoising_patch, group_size);
 
@@ -599,9 +666,6 @@ __device__ static inline float collaborative_hard(float *__restrict__ denoising_
 
 template <int stride = 32>
 __device__ static inline float wiener_filtering(float *__restrict__ data, float *__restrict__ ref, float sigma, int group_size, unsigned int mask) {
-    int lane_id;
-    asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
-
 #if __CUDA_ARCH__ == 750 || __CUDA_ARCH__ == 860
     float ks[4]{};
 #else
@@ -609,12 +673,12 @@ __device__ static inline float wiener_filtering(float *__restrict__ data, float 
 #endif
 
 #pragma unroll
-    for (int i = 0; i < 64; ++i) {
+    for (int i = 0; i < MAX_GROUP_SIZE * 8; ++i) {
         auto val = data[i * stride];
         auto ref_val = ref[i * stride];
         const float scaled_sigma = sigma * sqrtf(group_size * (1.0f / 8.0f));
         float coeff = (ref_val * ref_val) / (ref_val * ref_val + scaled_sigma * scaled_sigma);
-        if ((lane_id & 7) >= group_size) coeff = 0.0f;
+        if ((i >> 3) >= group_size) coeff = 0.0f;
         val *= coeff;
 #if __CUDA_ARCH__ == 750 || __CUDA_ARCH__ == 860
         ks[i % 4] += coeff * coeff;
@@ -640,15 +704,15 @@ __device__ static inline float collaborative_wiener(
 
 #pragma unroll
     for (int ndim = 0; ndim < 2; ++ndim) {
-        transform_pack8_interleave4<TRANSFORM_2D<true>, stride1, 8, stride2>(denoising_patch, buffer);
-        transpose_pack8_interleave4<stride1, 8, stride2>(denoising_patch, buffer);
+        transform_pack8_interleave4<TRANSFORM_2D<true>, stride1, MAX_GROUP_SIZE, stride2>(denoising_patch, buffer);
+        transpose_pack8_interleave4<stride1, MAX_GROUP_SIZE, stride2>(denoising_patch, buffer, mask);
     }
     transform_group<true>(denoising_patch, group_size);
 
 #pragma unroll
     for (int ndim = 0; ndim < 2; ++ndim) {
-        transform_pack8_interleave4<TRANSFORM_2D<true>, stride1, 8, stride2>(ref_patch, buffer);
-        transpose_pack8_interleave4<stride1, 8, stride2>(ref_patch, buffer);
+        transform_pack8_interleave4<TRANSFORM_2D<true>, stride1, MAX_GROUP_SIZE, stride2>(ref_patch, buffer);
+        transpose_pack8_interleave4<stride1, MAX_GROUP_SIZE, stride2>(ref_patch, buffer, mask);
     }
     transform_group<true>(ref_patch, group_size);
 
@@ -656,8 +720,8 @@ __device__ static inline float collaborative_wiener(
 
 #pragma unroll
     for (int ndim = 0; ndim < 2; ++ndim) {
-        transform_pack8_interleave4<TRANSFORM_2D<false>, stride1, 8, stride2>(denoising_patch, buffer);
-        transpose_pack8_interleave4<stride1, 8, stride2>(denoising_patch, buffer);
+        transform_pack8_interleave4<TRANSFORM_2D<false>, stride1, MAX_GROUP_SIZE, stride2>(denoising_patch, buffer);
+        transpose_pack8_interleave4<stride1, MAX_GROUP_SIZE, stride2>(denoising_patch, buffer, mask);
     }
     transform_group<false>(denoising_patch, group_size);
 
@@ -694,6 +758,11 @@ extern "C" __global__ __launch_bounds__(THREADS, MINB) void bm3d(
     const float *__restrict__ src) {
 
     __shared__ float buffer_all[WARPS][8 * smem_stride];
+    __shared__ int match_x[WARPS][GROUPS_PER_WARP][GROUP_WIDTH];
+    __shared__ int match_y[WARPS][GROUPS_PER_WARP][GROUP_WIDTH];
+#if TEMPORAL
+    __shared__ int match_z[WARPS][GROUPS_PER_WARP][GROUP_WIDTH];
+#endif
 
     int lane_id;
     asm volatile("mov.u32 %0, %%laneid;" : "=r"(lane_id));
@@ -703,8 +772,16 @@ extern "C" __global__ __launch_bounds__(THREADS, MINB) void bm3d(
 
     const int gid = blockIdx.x * WARPS + warp_id;
 
-    const int sub_lane_id = lane_id % 8;
-    int x = (4 * gid + lane_id / 8) * BLOCK_STEP;
+    const int group_lane = lane_id & (GROUP_WIDTH - 1);
+    const int group_id = lane_id / GROUP_WIDTH;
+    const unsigned int group_mask = ((1u << GROUP_WIDTH) - 1u) << (lane_id & -GROUP_WIDTH);
+#if GROUP_WIDTH == 8
+    const unsigned int half_mask = group_mask;
+#else
+    const unsigned int half_mask = 0xFFu << (lane_id & -8);
+#endif
+    const int sub_lane_id = lane_id & 7;
+    int x = (GROUPS_PER_WARP * gid + group_id) * BLOCK_STEP;
     int y = BLOCK_STEP * blockIdx.y;
     if (x >= WIDTH - 8 + BLOCK_STEP || y >= HEIGHT - 8 + BLOCK_STEP) {
         return;
@@ -716,21 +793,20 @@ extern "C" __global__ __launch_bounds__(THREADS, MINB) void bm3d(
     float current_patch[8];
     const float *const srcpc = &src[KRADIUS * TEMPORAL_STRIDE + sub_lane_id];
 
-    int membermask =
-        ((4 * gid * BLOCK_STEP >= BM_RANGE) && ((4 * gid + 3) * BLOCK_STEP <= WIDTH - 8 - BM_RANGE))
-            ? 0xFFFFFFFF
-            : 0xFF << (lane_id & -8);
-    float errors8 = FLT_MAX_;
-    int index8_x = 0;
-    int index8_y = 0;
+    int membermask = group_mask;
+    float errors16 = FLT_MAX_;
+    int index16_x = 0;
+    int index16_y = 0;
 
     if constexpr (TAU_MATCH > 0.0f) {
     {
         const float *srcp = &srcpc[y * STRIDE + x];
 
+        if (group_lane < 8) {
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            current_patch[i] = srcp[i * STRIDE];
+            for (int i = 0; i < 8; ++i) {
+                current_patch[i] = srcp[i * STRIDE];
+            }
         }
     }
 
@@ -746,29 +822,31 @@ extern "C" __global__ __launch_bounds__(THREADS, MINB) void bm3d(
             for (int col_i = left; col_i <= right; ++col_i) {
                 auto active_mask = membermask;
 
-                float neighbor_patch[8];
-
                 __syncwarp(membermask);
 
+                float error = 0.0f;
+                if (group_lane < 8) {
+                    float neighbor_patch[8];
 #pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    neighbor_patch[i] = srcp_col[i * STRIDE];
+                    for (int i = 0; i < 8; ++i) {
+                        neighbor_patch[i] = srcp_col[i * STRIDE];
+                    }
+                    error = BM_ERROR(current_patch, neighbor_patch, half_mask);
                 }
+                error = __shfl_sync(group_mask, error, 0, GROUP_WIDTH);
 
-                float error = BM_ERROR(current_patch, neighbor_patch, active_mask);
+                auto pre_error = __shfl_up_sync(active_mask, errors16, 1, GROUP_WIDTH);
+                int pre_index_x = __shfl_up_sync(active_mask, index16_x, 1, GROUP_WIDTH);
+                int pre_index_y = __shfl_up_sync(active_mask, index16_y, 1, GROUP_WIDTH);
 
-                auto pre_error = __shfl_up_sync(active_mask, errors8, 1, 8);
-                int pre_index_x = __shfl_up_sync(active_mask, index8_x, 1, 8);
-                int pre_index_y = __shfl_up_sync(active_mask, index8_y, 1, 8);
-
-                int flag = (col_i != x || row_i != y) && error <= TAU_MATCH && error < errors8;
-                int pre_flag = __shfl_up_sync(active_mask, flag, 1, 8);
+                int flag = (col_i != x || row_i != y) && error <= TAU_MATCH && error < errors16;
+                int pre_flag = __shfl_up_sync(active_mask, flag, 1, GROUP_WIDTH);
 
                 if (flag) {
-                    int first = (sub_lane_id == 0) || (!pre_flag);
-                    errors8 = first ? error : pre_error;
-                    index8_x = first ? col_i : pre_index_x;
-                    index8_y = first ? row_i : pre_index_y;
+                    int first = (group_lane == 0) || (!pre_flag);
+                    errors16 = first ? error : pre_error;
+                    index16_x = first ? col_i : pre_index_x;
+                    index16_y = first ? row_i : pre_index_y;
                 }
 
                 ++srcp_col;
@@ -778,32 +856,32 @@ extern "C" __global__ __launch_bounds__(THREADS, MINB) void bm3d(
         }
     }
     }
-    [[maybe_unused]] int index8_z = KRADIUS;
+    [[maybe_unused]] int index16_z = KRADIUS;
 
 #if TEMPORAL
     if constexpr (TAU_MATCH > 0.0f) {
     {
-        membermask = 0xFF << (lane_id & -8); // only sub-warp convergence guaranteed
+        membermask = group_mask;
 
-        int center_index8_x = index8_x;
-        int center_index8_y = index8_y;
+        int center_index16_x = index16_x;
+        int center_index16_y = index16_y;
 
 #pragma unroll
         for (int direction = -1; direction <= 1; direction += 2) {
-            int last_index8_x = center_index8_x;
-            int last_index8_y = center_index8_y;
+            int last_index16_x = center_index16_x;
+            int last_index16_y = center_index16_y;
 
             for (int t = 1; t <= KRADIUS; ++t) {
                 int temporal_index = KRADIUS + direction * t;
-                float frame_errors8 = FLT_MAX_;
-                int frame_index8_x = 0;
-                int frame_index8_y = 0;
+                float frame_errors16 = FLT_MAX_;
+                int frame_index16_x = 0;
+                int frame_index16_y = 0;
 
                 const float *temporal_srcpc = &src[temporal_index * TEMPORAL_STRIDE + sub_lane_id];
 
                 for (int i = 0; i < PS_NUM; ++i) {
-                    int xx = __shfl_sync(0xFFFFFFFF, last_index8_x, i, 8);
-                    int yy = __shfl_sync(0xFFFFFFFF, last_index8_y, i, 8);
+                    int xx = __shfl_sync(group_mask, last_index16_x, i, GROUP_WIDTH);
+                    int yy = __shfl_sync(group_mask, last_index16_y, i, GROUP_WIDTH);
 
                     int left = max(xx - PS_RANGE, 0);
                     int right = min(xx + PS_RANGE, WIDTH - 8);
@@ -816,29 +894,31 @@ extern "C" __global__ __launch_bounds__(THREADS, MINB) void bm3d(
                         for (int col_i = left; col_i <= right; ++col_i) {
                             auto active_mask = membermask;
 
-                            float neighbor_patch[8];
-
                             __syncwarp(membermask);
 
+                            float error = 0.0f;
+                            if (group_lane < 8) {
+                                float neighbor_patch[8];
 #pragma unroll
-                            for (int i = 0; i < 8; ++i) {
-                                neighbor_patch[i] = srcp_col[i * STRIDE];
+                                for (int i = 0; i < 8; ++i) {
+                                    neighbor_patch[i] = srcp_col[i * STRIDE];
+                                }
+                                error = BM_ERROR(current_patch, neighbor_patch, half_mask);
                             }
+                            error = __shfl_sync(group_mask, error, 0, GROUP_WIDTH);
 
-                            float error = BM_ERROR(current_patch, neighbor_patch, active_mask);
+                            float pre_error = __shfl_up_sync(active_mask, frame_errors16, 1, GROUP_WIDTH);
+                            int pre_index_x = __shfl_up_sync(active_mask, frame_index16_x, 1, GROUP_WIDTH);
+                            int pre_index_y = __shfl_up_sync(active_mask, frame_index16_y, 1, GROUP_WIDTH);
 
-                            float pre_error = __shfl_up_sync(active_mask, frame_errors8, 1, 8);
-                            int pre_index_x = __shfl_up_sync(active_mask, frame_index8_x, 1, 8);
-                            int pre_index_y = __shfl_up_sync(active_mask, frame_index8_y, 1, 8);
-
-                            int flag = error <= TAU_MATCH && error < frame_errors8;
-                            int pre_flag = __shfl_up_sync(active_mask, flag, 1, 8);
+                            int flag = error <= TAU_MATCH && error < frame_errors16;
+                            int pre_flag = __shfl_up_sync(active_mask, flag, 1, GROUP_WIDTH);
 
                             if (flag) {
-                                int first = (sub_lane_id == 0) || (!pre_flag);
-                                frame_errors8 = first ? error : pre_error;
-                                frame_index8_x = first ? col_i : pre_index_x;
-                                frame_index8_y = first ? row_i : pre_index_y;
+                                int first = (group_lane == 0) || (!pre_flag);
+                                frame_errors16 = first ? error : pre_error;
+                                frame_index16_x = first ? col_i : pre_index_x;
+                                frame_index16_y = first ? row_i : pre_index_y;
                             }
 
                             ++srcp_col;
@@ -849,28 +929,28 @@ extern "C" __global__ __launch_bounds__(THREADS, MINB) void bm3d(
                 }
 
                 for (int i = 0; i < PS_NUM; ++i) {
-                    float tmp_error = __shfl_sync(0xFFFFFFFF, frame_errors8, i, 8);
-                    int tmp_x = __shfl_sync(0xFFFFFFFF, frame_index8_x, i, 8);
-                    int tmp_y = __shfl_sync(0xFFFFFFFF, frame_index8_y, i, 8);
+                    float tmp_error = __shfl_sync(group_mask, frame_errors16, i, GROUP_WIDTH);
+                    int tmp_x = __shfl_sync(group_mask, frame_index16_x, i, GROUP_WIDTH);
+                    int tmp_y = __shfl_sync(group_mask, frame_index16_y, i, GROUP_WIDTH);
 
-                    int flag = tmp_error < errors8;
-                    int pre_flag = __shfl_up_sync(0xFFFFFFFF, flag, 1, 8);
-                    float pre_error = __shfl_up_sync(0xFFFFFFFF, errors8, 1, 8);
-                    int pre_index_x = __shfl_up_sync(0xFFFFFFFF, index8_x, 1, 8);
-                    int pre_index_y = __shfl_up_sync(0xFFFFFFFF, index8_y, 1, 8);
-                    int pre_index_z = __shfl_up_sync(0xFFFFFFFF, index8_z, 1, 8);
+                    int flag = tmp_error < errors16;
+                    int pre_flag = __shfl_up_sync(group_mask, flag, 1, GROUP_WIDTH);
+                    float pre_error = __shfl_up_sync(group_mask, errors16, 1, GROUP_WIDTH);
+                    int pre_index_x = __shfl_up_sync(group_mask, index16_x, 1, GROUP_WIDTH);
+                    int pre_index_y = __shfl_up_sync(group_mask, index16_y, 1, GROUP_WIDTH);
+                    int pre_index_z = __shfl_up_sync(group_mask, index16_z, 1, GROUP_WIDTH);
 
                     if (flag) {
-                        int first = (sub_lane_id == 0) || (!pre_flag);
-                        errors8 = first ? tmp_error : pre_error;
-                        index8_x = first ? tmp_x : pre_index_x;
-                        index8_y = first ? tmp_y : pre_index_y;
-                        index8_z = first ? temporal_index : pre_index_z;
+                        int first = (group_lane == 0) || (!pre_flag);
+                        errors16 = first ? tmp_error : pre_error;
+                        index16_x = first ? tmp_x : pre_index_x;
+                        index16_y = first ? tmp_y : pre_index_y;
+                        index16_z = first ? temporal_index : pre_index_z;
                     }
                 }
 
-                last_index8_x = frame_index8_x;
-                last_index8_y = frame_index8_y;
+                last_index16_x = frame_index16_x;
+                last_index16_y = frame_index16_y;
             }
         }
     }
@@ -878,46 +958,71 @@ extern "C" __global__ __launch_bounds__(THREADS, MINB) void bm3d(
 #endif // TEMPORAL
 
     {
-        const unsigned int active_mask = 0xFFu << (lane_id & -8);
+        if constexpr (TAU_MATCH > 0.0f) {
+            const unsigned int active_mask = group_mask;
 
-        int flag;
+            int flag;
 #if TEMPORAL
-        flag = index8_x == x && index8_y == y && index8_z == KRADIUS;
+            flag = index16_x == x && index16_y == y && index16_z == KRADIUS;
 #else
-        flag = index8_x == x && index8_y == y;
+            flag = index16_x == x && index16_y == y;
 #endif
 
-        flag += __shfl_xor_sync(active_mask, flag, 1, 8);
-        flag += __shfl_xor_sync(active_mask, flag, 2, 8);
-        flag += __shfl_xor_sync(active_mask, flag, 4, 8);
-
-        float pre_error = __shfl_up_sync(active_mask, errors8, 1, 8);
-        int pre_index_x = __shfl_up_sync(active_mask, index8_x, 1, 8);
-        int pre_index_y = __shfl_up_sync(active_mask, index8_y, 1, 8);
-        [[maybe_unused]] int pre_index_z;
-#if TEMPORAL
-        pre_index_z = __shfl_up_sync(active_mask, index8_z, 1, 8);
+            flag += __shfl_xor_sync(active_mask, flag, 1, GROUP_WIDTH);
+            flag += __shfl_xor_sync(active_mask, flag, 2, GROUP_WIDTH);
+            flag += __shfl_xor_sync(active_mask, flag, 4, GROUP_WIDTH);
+#if GROUP_WIDTH > 8
+            flag += __shfl_xor_sync(active_mask, flag, 8, GROUP_WIDTH);
 #endif
-        if (!flag) {
-            int first = (sub_lane_id == 0);
-            errors8 = first ? 0.0f : pre_error;
-            index8_x = first ? x : pre_index_x;
-            index8_y = first ? y : pre_index_y;
+
+            float pre_error = __shfl_up_sync(active_mask, errors16, 1, GROUP_WIDTH);
+            int pre_index_x = __shfl_up_sync(active_mask, index16_x, 1, GROUP_WIDTH);
+            int pre_index_y = __shfl_up_sync(active_mask, index16_y, 1, GROUP_WIDTH);
+            [[maybe_unused]] int pre_index_z;
 #if TEMPORAL
-            index8_z = first ? KRADIUS : pre_index_z;
+            pre_index_z = __shfl_up_sync(active_mask, index16_z, 1, GROUP_WIDTH);
+#endif
+            if (!flag) {
+                int first = (group_lane == 0);
+                errors16 = first ? 0.0f : pre_error;
+                index16_x = first ? x : pre_index_x;
+                index16_y = first ? y : pre_index_y;
+#if TEMPORAL
+                index16_z = first ? KRADIUS : pre_index_z;
+#endif
+            }
+        } else {
+            // A zero threshold skips candidate search. Keep the reference block
+            // explicitly so the compacted group still has one valid member.
+            errors16 = group_lane == 0 ? 0.0f : FLT_MAX_;
+            index16_x = x;
+            index16_y = y;
+#if TEMPORAL
+            index16_z = KRADIUS;
 #endif
         }
     }
 
-    // The matcher keeps one sorted candidate in each lane. Count only
-    // candidates that passed tau_match and round down to the largest supported
-    // transform length. The reference block inserted above guarantees K>=1.
-    const unsigned int subwarp_mask = 0xFFu << (lane_id & -8);
-    const int matched = __popc(__ballot_sync(subwarp_mask, errors8 <= TAU_MATCH));
-    const int group_size = matched >= 8 ? 8 : (matched >= 4 ? 4 : (matched >= 2 ? 2 : 1));
+    // Keep every candidate that passed tau_match, up to the configured cap.
+    // The reference block inserted above guarantees K>=1.
+    const int matched = __popc(__ballot_sync(group_mask, errors16 <= TAU_MATCH));
+    const int group_size = min(matched, MAX_GROUP_SIZE);
 
-    float denoising_patch[64];
-    [[maybe_unused]] float ref_patch[64];
+    match_x[warp_id][group_id][group_lane] = index16_x;
+    match_y[warp_id][group_id][group_lane] = index16_y;
+#if TEMPORAL
+    match_z[warp_id][group_id][group_lane] = index16_z;
+#endif
+    __syncwarp(group_mask);
+
+    // The second half of the group was only needed to hold candidate ranks.
+    // Keeping it out of the transforms avoids duplicating all 3D work.
+    if (group_lane >= 8) return;
+
+    const unsigned int subwarp_mask = half_mask;
+
+    float denoising_patch[MAX_GROUP_SIZE * 8];
+    [[maybe_unused]] float ref_patch[MAX_GROUP_SIZE * 8];
 
 #pragma unroll
     for (int plane = 0; plane < NUM_PLANES; ++plane) {
@@ -942,12 +1047,12 @@ extern "C" __global__ __launch_bounds__(THREADS, MINB) void bm3d(
 #if FINAL
         {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                int tmp_x = __shfl_sync(0xFFFFFFFF, index8_x, i, 8);
-                int tmp_y = __shfl_sync(0xFFFFFFFF, index8_y, i, 8);
+            for (int i = 0; i < MAX_GROUP_SIZE; ++i) {
+                int tmp_x = match_x[warp_id][group_id][i];
+                int tmp_y = match_y[warp_id][group_id][i];
                 const float *refp;
 #if TEMPORAL
-                int tmp_z = __shfl_sync(0xFFFFFFFF, index8_z, i, 8);
+                int tmp_z = match_z[warp_id][group_id][i];
                 refp = &src[tmp_z * TEMPORAL_STRIDE + tmp_y * STRIDE + tmp_x + sub_lane_id];
 #else
                 refp = &src[tmp_y * STRIDE + tmp_x + sub_lane_id];
@@ -966,12 +1071,12 @@ extern "C" __global__ __launch_bounds__(THREADS, MINB) void bm3d(
 #else
         {
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                int tmp_x = __shfl_sync(0xFFFFFFFF, index8_x, i, 8);
-                int tmp_y = __shfl_sync(0xFFFFFFFF, index8_y, i, 8);
+            for (int i = 0; i < MAX_GROUP_SIZE; ++i) {
+                int tmp_x = match_x[warp_id][group_id][i];
+                int tmp_y = match_y[warp_id][group_id][i];
                 const float *srcp;
 #if TEMPORAL
-                int tmp_z = __shfl_sync(0xFFFFFFFF, index8_z, i, 8);
+                int tmp_z = match_z[warp_id][group_id][i];
                 srcp = &src[tmp_z * TEMPORAL_STRIDE + tmp_y * STRIDE + tmp_x + sub_lane_id];
 #else
                 srcp = &src[tmp_y * STRIDE + tmp_x + sub_lane_id];
@@ -991,13 +1096,13 @@ extern "C" __global__ __launch_bounds__(THREADS, MINB) void bm3d(
         float *const weightpc = &res[TEMPORAL_STRIDE + sub_lane_id];
 
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < MAX_GROUP_SIZE; ++i) {
             if (i >= group_size) continue;
-            int tmp_x = __shfl_sync(0xFFFFFFFF, index8_x, i, 8);
-            int tmp_y = __shfl_sync(0xFFFFFFFF, index8_y, i, 8);
+            int tmp_x = match_x[warp_id][group_id][i];
+            int tmp_y = match_y[warp_id][group_id][i];
             int offset;
 #if TEMPORAL
-            int tmp_z = __shfl_sync(0xFFFFFFFF, index8_z, i, 8);
+            int tmp_z = match_z[warp_id][group_id][i];
             offset = tmp_z * 2 * TEMPORAL_STRIDE + tmp_y * STRIDE + tmp_x;
 #else
             offset = tmp_y * STRIDE + tmp_x;
@@ -1008,9 +1113,8 @@ extern "C" __global__ __launch_bounds__(THREADS, MINB) void bm3d(
 
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                const float window = kaiser8(sub_lane_id) * kaiser8(j);
-                float wdst_val = adaptive_weight * denoising_patch[i * 8 + j] * window;
-                float weight_val = adaptive_weight * window;
+                float wdst_val = adaptive_weight * denoising_patch[i * 8 + j];
+                float weight_val = adaptive_weight;
 
                 wdst_val = (wdst_val + EXTRACTOR) - EXTRACTOR;
                 weight_val = (weight_val + EXTRACTOR) - EXTRACTOR;

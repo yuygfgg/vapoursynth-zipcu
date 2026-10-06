@@ -58,6 +58,7 @@ core.vszipcu.BM3Dv2(clip clip[,      # and BM3D, same signature
     float   tau_match,               # block-match MSE in 8-bit units; default follows sigma/profile
     int[]   block_step=8,            # per-plane, 1..8
     int[]   bm_range=9,              # per-plane, > 0
+    int[]   group_size=16,           # per-plane, 1..16; DCT supports all values
     int     radius=0,                # temporal radius; 0 = spatial only
     int[]   ps_num=2, int[] ps_range=4,
     bint    chroma=False,            # CBM3D; YUV444PS only, block matching on Y
@@ -74,6 +75,10 @@ core.vszipcu.VAggregate(clip clip, clip src, int[] planes)
 32-bit float only. `BM3Dv2` is the one-step interface; `BM3D` alone emits the stacked accumulator
 clip if you want to drive `VAggregate` yourself. Per-plane arrays follow upstream's rule: element
 *i*, when absent, falls back to element *i-1*.
+
+`group_size` is the maximum number of matched blocks retained for a reference block; the actual
+group can contain any number from 1 through that limit. The CUDA DCT path supports all limits up
+to 16. The other 1D transforms use power-of-two group lengths only: 1, 2, 4, or 8.
 
 **`fast_fused`** (BM3Dv2, `radius > 0`): runs the collaborative filter and the temporal
 aggregation as one kernel chain, keeping the accumulator stack on the GPU. Byte-identical output,
